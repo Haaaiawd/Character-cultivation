@@ -1,0 +1,101 @@
+# app/crud/crud_game.py
+from sqlalchemy.orm import Session
+from typing import List, Optional, Dict, Any
+
+from app.models.game_models import GameState, GameSave
+# Note: Schemas like GameStateCreate are for API input, not direct DB creation here.
+# CRUD functions typically take model instances or primitive types for creation/update.
+
+def create_game_state(db: Session, character_id: int, initial_scene_id: Optional[str] = "start", initial_history: Optional[List[Dict[str,Any]]] = None) -> GameState:
+    """Creates a new game state for a character."""
+    db_game_state = GameState(
+        character_id=character_id,
+        current_scene_id=initial_scene_id,
+        story_history=initial_history if initial_history is not None else [], # Ensure list
+        game_data={} # Start with empty game_data
+    )
+    db.add(db_game_state)
+    db.commit()
+    db.refresh(db_game_state)
+    return db_game_state
+
+def get_game_state(db: Session, game_state_id: int) -> Optional[GameState]:
+    """Retrieves a specific game state by its ID."""
+    return db.query(GameState).filter(GameState.id == game_state_id).first()
+
+def get_active_game_state_for_character(db: Session, character_id: int) -> Optional[GameState]:
+    """
+    Retrieves the most recently updated game state for a character,
+    considered the 'active' one for MVP.
+    """
+    return db.query(GameState).filter(GameState.character_id == character_id).order_by(GameState.updated_at.desc()).first()
+
+def update_game_state(
+    db: Session,
+    game_state: GameState,
+    story_event: Dict[str, Any],
+    new_scene_id: Optional[str],
+    game_data_updates: Optional[Dict[str, Any]] = None
+) -> GameState:
+    """
+    Updates a game state: appends to story history, changes current scene,
+    and merges updates into game_data.
+    """
+    current_history = game_state.story_history
+    # Ensure story_history is a list, even if it was None/null from DB (though model default is list)
+    if not isinstance(current_history, list):
+        current_history = []
+    # Ensure all elements in current_history are dicts, if not, this might indicate corruption or wrong data type.
+    # For robustness, one might filter or log, but here we assume it's a list of dicts or an empty list.
+    game_state.story_history = current_history + [story_event]
+
+    if new_scene_id is not None: # Only update if a new_scene_id is explicitly provided
+        game_state.current_scene_id = new_scene_id
+
+    current_game_data = game_state.game_data
+    # Ensure game_data is a dict, even if it was None/null from DB (though model default is dict)
+    if not isinstance(current_game_data, dict):
+        current_game_data = {}
+    if game_data_updates:
+        game_state.game_data = {**current_game_data, **game_data_updates} # Merge updates
+
+    # updated_at should be handled by onupdate in the model, but explicit add signals change.
+    # Forcing update of updated_at if model's onupdate is not working or not set for all ORMs/cases
+    # from datetime import datetime
+    # game_state.updated_at = datetime.utcnow() # Uncomment if explicit update is needed
+    db.add(game_state)
+    db.commit()
+    db.refresh(game_state)
+    return game_state
+
+def create_game_save(
+    db: Session,
+    user_id: int,
+    character_id: int,
+    game_state_id: int,
+    save_name: str,
+    save_slot: Optional[int] = None
+) -> GameSave:
+    """Creates a new game save entry."""
+    db_game_save = GameSave(
+        user_id=user_id,
+        character_id=character_id,
+        game_state_id=game_state_id,
+        save_name=save_name,
+        save_slot=save_slot
+    )
+    db.add(db_game_save)
+    db.commit()
+    db.refresh(db_game_save)
+    return db_game_save
+
+def get_game_save(db: Session, game_save_id: int) -> Optional[GameSave]:
+    """Retrieves a specific game save by its ID."""
+    return db.query(GameSave).filter(GameSave.id == game_save_id).first()
+
+def get_game_saves_by_user(db: Session, user_id: int, skip: int = 0, limit: int = 100) -> List[GameSave]:
+    """Retrieves a list of game saves for a specific user, ordered by creation date."""
+    return db.query(GameSave).filter(GameSave.user_id == user_id).order_by(GameSave.created_at.desc()).offset(skip).limit(limit).all()
+
+# Note: Delete operations for GameState or GameSave can be added later if required.
+# For MVP, they are not explicitly listed in the API endpoints.

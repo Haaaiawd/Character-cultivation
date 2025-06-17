@@ -23,46 +23,61 @@ def start_game(
     rag_sys: RAGSystem = Depends(deps.get_rag_system),
     plugin_mgr: PluginManager = Depends(deps.get_plugin_manager)
 ):
-    """Starts a new game for a character or resumes if an active game state exists (MVP: creates new)."""
     character = crud.crud_character.get_character(db, character_id=game_start_request.character_id)
     if not character or character.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Character not found or not owned by user")
 
-    # For MVP, starting a game always creates a new game state.
     game_state = crud.crud_game.create_game_state(db, character_id=character.id)
 
-    # Prepare data for 'game_started' event
-    char_data_for_event = schemas.CharacterDetailed.model_validate(character).model_dump()
-    gs_data_for_event = schemas.GameStateInDB.model_validate(game_state).model_dump()
+    char_model_for_event = schemas.CharacterDetailed.model_validate(character)
+    gs_model_for_event = schemas.GameStateInDB.model_validate(game_state)
 
     event_data = {
-        "character": char_data_for_event,
-        "game_state": gs_data_for_event,
+        "character": char_model_for_event.model_dump(),
+        "game_state": gs_model_for_event.model_dump(),
         "messages": []
     }
     event_data_after_plugins = plugin_mgr.emit_event("game_started", event_data)
 
-    char_dict_for_rag = event_data_after_plugins.get("character", char_data_for_event)
-    gs_dict_for_rag = event_data_after_plugins.get("game_state", gs_data_for_event)
+    char_dict_for_rag = event_data_after_plugins.get("character", char_model_for_event.model_dump())
+    gs_dict_for_rag = event_data_after_plugins.get("game_state", gs_model_for_event.model_dump())
 
-    story_scene = rag_sys.generate_story(
+    initial_story_scene = rag_sys.generate_story(
         game_state=gs_dict_for_rag,
         character=char_dict_for_rag
     )
 
-    current_story_event = {
-        "scene_id": story_scene.scene_id,
-        "scene_description": story_scene.description,
-        "choices_presented": [c.model_dump() for c in story_scene.choices],
-        "messages": event_data_after_plugins.get("messages", [])
+    initial_scene_duration = initial_story_scene.duration_days if initial_story_scene.duration_days is not None else 1
+    date_before_event = game_state.current_date
+
+    updated_gs_after_start_scene = crud.crud_game.update_game_state(
+        db, game_state=game_state,
+        story_event={},
+        new_scene_id=initial_story_scene.scene_id,
+        advance_days=initial_scene_duration
+    )
+
+    story_event_for_start = {
+        "scene_id": initial_story_scene.scene_id,
+        "plot": initial_story_scene.plot,
+        "choices_presented": [c.model_dump() for c in initial_story_scene.choices],
+        "messages": event_data_after_plugins.get("messages", []),
+        "event_type": "game_started",
+        "duration_applied_days": initial_scene_duration,
+        "date_before_event": date_before_event,
+        "date_after_event": updated_gs_after_start_scene.current_date
     }
-    crud.crud_game.update_game_state(db, game_state=game_state,
-                                   story_event=current_story_event,
-                                   new_scene_id=story_scene.scene_id)
+
+    if isinstance(updated_gs_after_start_scene.story_history, list):
+        updated_gs_after_start_scene.story_history = (updated_gs_after_start_scene.story_history or [])[:-1] + [story_event_for_start]
+    else: # Should not happen based on model default, but as a safeguard
+        updated_gs_after_start_scene.story_history = [story_event_for_start]
+    db.commit()
+    db.refresh(updated_gs_after_start_scene)
 
     return schemas.BaseResponse[schemas.StoryScene](
-        data=story_scene,
-        message="Game started. " + " ".join(event_data_after_plugins.get("messages", []))
+        data=initial_story_scene,
+        message="Game started. In-game date: " + str(updated_gs_after_start_scene.current_date) + ". " + " ".join(event_data_after_plugins.get("messages", []))
     )
 
 @router.post("/choice", response_model=schemas.BaseResponse[schemas.StoryScene])
@@ -74,79 +89,85 @@ def make_choice(
     rag_sys: RAGSystem = Depends(deps.get_rag_system),
     plugin_mgr: PluginManager = Depends(deps.get_plugin_manager)
 ):
-    """Processes a player's choice and returns the next game scene."""
     character = crud.crud_character.get_character(db, character_id=choice_request.character_id)
     if not character or character.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Character not found or not owned by user")
 
     game_state = crud.crud_game.get_active_game_state_for_character(db, character_id=character.id)
     if not game_state:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active game state not found for this character.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active game state not found.")
 
     made_choice_obj = {"id": choice_request.choice_id, "text": f"Choice text for {choice_request.choice_id} (not found in history)"}
     if game_state.story_history and isinstance(game_state.story_history, list) and len(game_state.story_history) > 0:
         last_event = game_state.story_history[-1]
         if isinstance(last_event, dict) and "choices_presented" in last_event and isinstance(last_event["choices_presented"], list):
             found_choice = next((c for c in last_event["choices_presented"] if isinstance(c, dict) and c.get("id") == choice_request.choice_id), None)
-            if found_choice:
-                made_choice_obj = found_choice
-            else:
-                print(f"Warning: Choice ID '{choice_request.choice_id}' not found in previous scene's choices for character {character.id}.")
-        else:
-            print(f"Warning: Malformed last event or 'choices_presented' in history for character {character.id}.")
-    else:
-        print(f"Warning: Empty story history for character {character.id}, cannot verify choice_id '{choice_request.choice_id}'.")
+            if found_choice: made_choice_obj = found_choice
+            else: print(f"Warning: Choice ID '{choice_request.choice_id}' not found in previous scene for char {character.id}.")
 
-    char_data_for_event = schemas.CharacterDetailed.model_validate(character).model_dump()
-    gs_data_for_event = schemas.GameStateInDB.model_validate(game_state).model_dump()
+    char_model_for_event = schemas.CharacterDetailed.model_validate(character)
+    gs_model_for_event = schemas.GameStateInDB.model_validate(game_state)
 
-    event_data = {
-        "character": char_data_for_event,
-        "game_state": gs_data_for_event,
+    event_data_choice_made = {
+        "character": char_model_for_event.model_dump(),
+        "game_state": gs_model_for_event.model_dump(),
         "choice": made_choice_obj,
         "messages": []
     }
-    event_data_after_plugins = plugin_mgr.emit_event("choice_made", event_data)
+    event_data_after_choice_plugins = plugin_mgr.emit_event("choice_made", event_data_choice_made)
 
-    char_dict_for_rag = event_data_after_plugins.get("character", char_data_for_event)
-    gs_dict_for_rag = event_data_after_plugins.get("game_state", gs_data_for_event)
+    char_dict_for_rag = event_data_after_choice_plugins.get("character", char_model_for_event.model_dump())
+    gs_dict_for_rag = event_data_after_choice_plugins.get("game_state", gs_model_for_event.model_dump())
 
     next_story_scene = rag_sys.generate_story(
         game_state=gs_dict_for_rag,
         character=char_dict_for_rag
     )
 
-    current_story_event = {
+    current_event_duration = next_story_scene.duration_days if next_story_scene.duration_days is not None else 1
+    date_before_event = game_state.current_date
+
+    game_data_plugin_updates = event_data_after_choice_plugins.get("game_state", {}).get("game_data")
+
+    updated_gs_after_choice_action = crud.crud_game.update_game_state(
+        db, game_state=game_state,
+        story_event={},
+        new_scene_id=next_story_scene.scene_id,
+        game_data_updates=game_data_plugin_updates,
+        advance_days=current_event_duration
+    )
+
+    story_event_for_choice = {
         "scene_id": next_story_scene.scene_id,
-        "scene_description": next_story_scene.description,
+        "plot": next_story_scene.plot,
         "choices_presented": [c.model_dump() for c in next_story_scene.choices],
         "action_taken": made_choice_obj,
-        "messages": event_data_after_plugins.get("messages", [])
+        "messages": event_data_after_choice_plugins.get("messages", []),
+        "event_type": "choice_made",
+        "duration_applied_days": current_event_duration,
+        "date_before_event": date_before_event,
+        "date_after_event": updated_gs_after_choice_action.current_date
     }
-
-    # Extract potential game_data updates from plugins
-    game_data_plugin_updates = event_data_after_plugins.get("game_state", {}).get("game_data")
-
-    updated_gs_after_choice = crud.crud_game.update_game_state(
-        db, game_state=game_state,
-        story_event=current_story_event,
-        new_scene_id=next_story_scene.scene_id,
-        game_data_updates=game_data_plugin_updates # Pass updates from plugins
-    )
+    if isinstance(updated_gs_after_choice_action.story_history, list):
+        updated_gs_after_choice_action.story_history = (updated_gs_after_choice_action.story_history or [])[:-1] + [story_event_for_choice]
+    else: # Should not happen
+        updated_gs_after_choice_action.story_history = [story_event_for_choice]
+    db.commit()
+    db.refresh(updated_gs_after_choice_action)
 
     scene_event_data = {
         "character": char_dict_for_rag,
-        "game_state": schemas.GameStateInDB.model_validate(updated_gs_after_choice).model_dump(),
+        "game_state": schemas.GameStateInDB.model_validate(updated_gs_after_choice_action).model_dump(),
         "scene": next_story_scene.model_dump(),
         "messages": []
     }
     scene_event_data_after_plugins = plugin_mgr.emit_event("scene_generated", scene_event_data)
 
-    final_messages = event_data_after_plugins.get("messages", []) + scene_event_data_after_plugins.get("messages", [])
+    final_messages = event_data_after_choice_plugins.get("messages", []) + scene_event_data_after_plugins.get("messages", [])
 
     return schemas.BaseResponse[schemas.StoryScene](
         data=next_story_scene,
-        message="Choice processed. " + " ".join(m for m in final_messages if isinstance(m, str))
+        message="Choice processed. In-game date: " + str(updated_gs_after_choice_action.current_date) + ". " + " ".join(m for m in final_messages if isinstance(m, str))
     )
 
 @router.get("/state/{character_id}", response_model=schemas.BaseResponse[schemas.GameStateInDB])
@@ -155,108 +176,133 @@ def get_character_game_state(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(deps.get_current_active_user)
 ):
-    """Retrieves the active game state for a specific character."""
     character = crud.crud_character.get_character(db, character_id=character_id)
     if not character or character.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Character not found.")
-
     game_state = crud.crud_game.get_active_game_state_for_character(db, character_id=character.id)
     if not game_state:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active game state not found for this character.")
-
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active game state not found.")
     return schemas.BaseResponse[schemas.GameStateInDB](data=schemas.GameStateInDB.model_validate(game_state))
 
 @router.post("/save", response_model=schemas.BaseResponse[schemas.GameSaveInDB])
-def save_current_game(
+def save_game(
     *,
     db: Session = Depends(get_db),
     save_request: schemas.GameSaveCreate,
     current_user: UserModel = Depends(deps.get_current_active_user)
 ):
-    """Saves the current game progress for a character."""
     character = crud.crud_character.get_character(db, character_id=save_request.character_id)
     if not character or character.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Character not found for saving progress.")
-
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Character not found for save.")
     active_game_state = crud.crud_game.get_active_game_state_for_character(db, character_id=save_request.character_id)
     if not active_game_state:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active game state to save for this character.")
-
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active game to save.")
     game_save = crud.crud_game.create_game_save(
-        db=db,
-        user_id=current_user.id,
-        character_id=save_request.character_id,
-        game_state_id=active_game_state.id,
-        save_name=save_request.save_name,
-        save_slot=save_request.save_slot
+        db=db, user_id=current_user.id, character_id=save_request.character_id,
+        game_state_id=active_game_state.id, save_name=save_request.save_name, save_slot=save_request.save_slot
     )
-    return schemas.BaseResponse[schemas.GameSaveInDB](
-        data=schemas.GameSaveInDB.model_validate(game_save),
-        message="Game progress saved successfully."
-    )
+    return schemas.BaseResponse[schemas.GameSaveInDB](data=schemas.GameSaveInDB.model_validate(game_save), message="Game saved.")
 
 @router.get("/saves", response_model=schemas.BaseResponse[List[schemas.GameSaveInDB]])
-def list_user_saves(
+def list_saves(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(deps.get_current_active_user),
-    skip: int = 0,
-    limit: int = 100
+    skip: int = 0, limit: int = 100
 ):
-    """Lists all game saves for the current user."""
     game_saves = crud.crud_game.get_game_saves_by_user(db, user_id=current_user.id, skip=skip, limit=limit)
-    validated_saves = [schemas.GameSaveInDB.model_validate(gs) for gs in game_saves]
-    return schemas.BaseResponse[List[schemas.GameSaveInDB]](data=validated_saves)
+    return schemas.BaseResponse[List[schemas.GameSaveInDB]](data=[schemas.GameSaveInDB.model_validate(gs) for gs in game_saves])
 
 @router.post("/load", response_model=schemas.BaseResponse[schemas.StoryScene])
-def load_saved_game(
+def load_game(
     *,
     db: Session = Depends(get_db),
     load_request: schemas.GameLoadRequest,
     current_user: UserModel = Depends(deps.get_current_active_user),
-    rag_sys: RAGSystem = Depends(deps.get_rag_system)
+    rag_sys: RAGSystem = Depends(deps.get_rag_system),
+    plugin_mgr: PluginManager = Depends(deps.get_plugin_manager)
 ):
-    """Loads a game from a save point and returns the current scene."""
     game_save = crud.crud_game.get_game_save(db, game_save_id=load_request.save_id)
     if not game_save or game_save.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Game save not found or access denied.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Game save not found.")
 
-    loaded_game_state = crud.crud_game.get_game_state(db, game_state_id=game_save.game_state_id)
-    if not loaded_game_state:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Corrupted save data: Associated game state not found.")
+    loaded_game_state_from_db = crud.crud_game.get_game_state(db, game_state_id=game_save.game_state_id)
+    if not loaded_game_state_from_db:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Saved game state data not found.")
 
-    character = crud.crud_character.get_character(db, character_id=loaded_game_state.character_id)
-    if not character:
-         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Corrupted save data: Associated character for game state not found.")
-    if character.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access to this game character denied.")
+    character = crud.crud_character.get_character(db, character_id=loaded_game_state_from_db.character_id)
+    if not character or character.user_id != current_user.id:
+         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Character access denied.")
+
+    char_model_for_event = schemas.CharacterDetailed.model_validate(character)
+    gs_model_for_event = schemas.GameStateInDB.model_validate(loaded_game_state_from_db)
+
+    game_loaded_event_data = {
+        "character": char_model_for_event.model_dump(),
+        "game_state": gs_model_for_event.model_dump(),
+        "messages": []
+    }
+    event_data_after_load_plugins = plugin_mgr.emit_event("game_loaded", game_loaded_event_data)
+
+    # Use game state potentially modified by plugins for RAG and scene reconstruction
+    current_gs_dict = event_data_after_load_plugins.get("game_state", gs_model_for_event.model_dump())
+    current_char_dict = event_data_after_load_plugins.get("character", char_model_for_event.model_dump())
+
 
     story_scene_to_return: Optional[schemas.StoryScene] = None
-    if loaded_game_state.story_history and isinstance(loaded_game_state.story_history, list) and len(loaded_game_state.story_history) > 0:
-        last_event = loaded_game_state.story_history[-1]
-        if isinstance(last_event, dict) and "scene_description" in last_event and "choices_presented" in last_event and isinstance(last_event["choices_presented"], list):
+    if current_gs_dict.get("story_history") and isinstance(current_gs_dict["story_history"], list) and current_gs_dict["story_history"]:
+        last_event = current_gs_dict["story_history"][-1]
+        if isinstance(last_event, dict) and "plot" in last_event and "choices_presented" in last_event:
             story_scene_to_return = schemas.StoryScene(
-                scene_id=last_event.get("scene_id", loaded_game_state.current_scene_id),
-                description=last_event["scene_description"],
-                choices=[schemas.StoryChoice(**c) for c in last_event["choices_presented"] if isinstance(c, dict)]
+                scene_id=last_event.get("scene_id", current_gs_dict.get("current_scene_id")),
+                plot=last_event["plot"],
+                choices=[schemas.StoryChoice(**c) for c in last_event["choices_presented"] if isinstance(c, dict)],
+                duration_days=last_event.get("duration_applied_days")
             )
 
     if not story_scene_to_return:
-        story_scene_to_return = rag_sys.generate_story(
-            game_state=schemas.GameStateInDB.model_validate(loaded_game_state).model_dump(),
-            character=schemas.CharacterDetailed.model_validate(character).model_dump()
+        story_scene_from_rag = rag_sys.generate_story(
+            game_state=current_gs_dict,
+            character=current_char_dict
         )
-        if loaded_game_state.current_scene_id != story_scene_to_return.scene_id or not loaded_game_state.story_history:
-            resumed_event = {
-                "scene_id": story_scene_to_return.scene_id,
-                "scene_description": story_scene_to_return.description,
-                "choices_presented": [c.model_dump() for c in story_scene_to_return.choices],
-                "messages": ["Game loaded. Resuming narrative from a generated scene."]
-            }
-            crud.crud_game.update_game_state(db, game_state=loaded_game_state,
-                                           story_event=resumed_event,
-                                           new_scene_id=story_scene_to_return.scene_id)
+        loaded_event_duration = story_scene_from_rag.duration_days if story_scene_from_rag.duration_days is not None else 1
+        date_before_event = current_gs_dict.get("current_date", "Day 1")
+
+        # Update the GameState model instance from DB
+        updated_gs_after_load_resume = crud.crud_game.update_game_state(
+            db, game_state=loaded_game_state_from_db,
+            story_event={}, # Placeholder, updated below
+            new_scene_id=story_scene_from_rag.scene_id,
+            advance_days=loaded_event_duration
+        )
+
+        resumed_event = {
+            "scene_id": story_scene_from_rag.scene_id,
+            "plot": story_scene_from_rag.plot,
+            "choices_presented": [c.model_dump() for c in story_scene_from_rag.choices],
+            "messages": event_data_after_load_plugins.get("messages", []) + ["Game loaded. Resuming narrative with a newly generated scene."],
+            "event_type": "game_loaded_resume",
+            "duration_applied_days": loaded_event_duration,
+            "date_before_event": date_before_event,
+            "date_after_event": updated_gs_after_load_resume.current_date
+        }
+        if isinstance(updated_gs_after_load_resume.story_history, list):
+             updated_gs_after_load_resume.story_history = (updated_gs_after_load_resume.story_history or [])[:-1] + [resumed_event]
+        else: # Should not happen
+            updated_gs_after_load_resume.story_history = [resumed_event]
+        db.commit()
+        db.refresh(updated_gs_after_load_resume)
+
+        story_scene_to_return = story_scene_from_rag
+
+    if not story_scene_to_return:
+        return schemas.BaseResponse[schemas.StoryScene](success=False, message="Failed to reconstruct or generate scene on load.", data=None)
+
+    final_response_message = f"Game loaded from save '{game_save.save_name}'. Current in-game date: {loaded_game_state_from_db.current_date}."
+    plugin_messages_on_load = event_data_after_load_plugins.get("messages", [])
+    if plugin_messages_on_load:
+        final_response_message += " " + " ".join(m for m in plugin_messages_on_load if isinstance(m, str))
 
     return schemas.BaseResponse[schemas.StoryScene](
         data=story_scene_to_return,
-        message=f"Game loaded successfully from save '{game_save.save_name}'."
+        message=final_response_message
     )

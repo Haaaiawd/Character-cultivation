@@ -1,18 +1,20 @@
 # app/crud/crud_game.py
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
+import re # Import re for parsing "Day X"
 
 from app.models.game_models import GameState, GameSave
 # Note: Schemas like GameStateCreate are for API input, not direct DB creation here.
 # CRUD functions typically take model instances or primitive types for creation/update.
 
 def create_game_state(db: Session, character_id: int, initial_scene_id: Optional[str] = "start", initial_history: Optional[List[Dict[str,Any]]] = None) -> GameState:
-    """Creates a new game state for a character."""
+    """Creates a new game state for a character, initializing current_date."""
     db_game_state = GameState(
         character_id=character_id,
         current_scene_id=initial_scene_id,
-        story_history=initial_history if initial_history is not None else [], # Ensure list
-        game_data={} # Start with empty game_data
+        story_history=initial_history if initial_history is not None else [],
+        game_data={},
+        current_date="Day 1"  # ADDED: Initialize current_date
     )
     db.add(db_game_state)
     db.commit()
@@ -35,34 +37,47 @@ def update_game_state(
     game_state: GameState,
     story_event: Dict[str, Any],
     new_scene_id: Optional[str],
-    game_data_updates: Optional[Dict[str, Any]] = None
+    game_data_updates: Optional[Dict[str, Any]] = None,
+    advance_days: Optional[int] = None  # ADDED parameter
 ) -> GameState:
     """
     Updates a game state: appends to story history, changes current scene,
-    and merges updates into game_data.
+    updates game_data, and advances in-game date if specified.
     """
     current_history = game_state.story_history
-    # Ensure story_history is a list, even if it was None/null from DB (though model default is list)
     if not isinstance(current_history, list):
         current_history = []
-    # Ensure all elements in current_history are dicts, if not, this might indicate corruption or wrong data type.
-    # For robustness, one might filter or log, but here we assume it's a list of dicts or an empty list.
     game_state.story_history = current_history + [story_event]
 
-    if new_scene_id is not None: # Only update if a new_scene_id is explicitly provided
+    if new_scene_id is not None:
         game_state.current_scene_id = new_scene_id
 
     current_game_data = game_state.game_data
-    # Ensure game_data is a dict, even if it was None/null from DB (though model default is dict)
     if not isinstance(current_game_data, dict):
         current_game_data = {}
     if game_data_updates:
-        game_state.game_data = {**current_game_data, **game_data_updates} # Merge updates
+        game_state.game_data = {**current_game_data, **game_data_updates}
 
-    # updated_at should be handled by onupdate in the model, but explicit add signals change.
-    # Forcing update of updated_at if model's onupdate is not working or not set for all ORMs/cases
-    # from datetime import datetime
-    # game_state.updated_at = datetime.utcnow() # Uncomment if explicit update is needed
+    # ADDED: Logic to advance current_date
+    if advance_days is not None and advance_days > 0:
+        current_date_str = game_state.current_date if game_state.current_date else "Day 0" # Default if None
+        day_match = re.match(r"Day (\d+)", current_date_str)
+        if day_match:
+            try:
+                current_day_num = int(day_match.group(1))
+                new_day_num = current_day_num + advance_days
+                game_state.current_date = f"Day {new_day_num}"
+            except ValueError:
+                print(f"Warning: Could not parse day number from current_date '{current_date_str}'. Date not advanced.")
+                # Optionally, set to a default or log error more formally
+        else:
+            # If current_date is not in "Day X" format, and we need to advance,
+            # we could try to initialize it or log a warning.
+            # For simplicity, if format is unexpected, we'll start from advance_days.
+            print(f"Warning: current_date '{current_date_str}' not in 'Day X' format. Advancing from Day 0 implicitly.")
+            game_state.current_date = f"Day {advance_days}"
+
+
     db.add(game_state)
     db.commit()
     db.refresh(game_state)

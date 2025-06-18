@@ -28,7 +28,7 @@ class BasicCultivationPlugin(BasePlugin):
         super_initialized = super().initialize()
         if not super_initialized:
             return False # Stop if parent initialization failed
-        print(f"Plugin {self.name} initialized by example plugin. Ready to manage cultivation.")
+        logging.info(f"Plugin {self.name} initialized by example plugin. Ready to manage cultivation.")
         # Example: self.load_cultivation_data()
         return True
 

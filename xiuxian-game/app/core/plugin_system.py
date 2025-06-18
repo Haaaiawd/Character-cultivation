@@ -42,7 +42,12 @@ PLUGIN_EVENTS = {
     "character_created": "角色创建后触发",
     "game_started": "游戏开始时触发",
     "choice_made": "玩家做出选择后触发",
+<<<<<<< HEAD
     "scene_generated": "新场景生成后触发"
+=======
+    "scene_generated": "新场景生成后触发",
+    "game_loaded": "游戏从存档加载后触发" # ADDED
+>>>>>>> origin/haa
     # Add more events as needed
 }
 

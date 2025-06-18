@@ -103,7 +103,7 @@ def make_choice(
         if isinstance(last_event, dict) and "choices_presented" in last_event and isinstance(last_event["choices_presented"], list):
             found_choice = next((c for c in last_event["choices_presented"] if isinstance(c, dict) and c.get("id") == choice_request.choice_id), None)
             if found_choice: made_choice_obj = found_choice
-            else: print(f"Warning: Choice ID '{choice_request.choice_id}' not found in previous scene for char {character.id}.")
+            else: logging.warning(f"Choice ID '{choice_request.choice_id}' not found in previous scene for char {character.id}.")
 
     char_model_for_event = schemas.CharacterDetailed.model_validate(character)
     gs_model_for_event = schemas.GameStateInDB.model_validate(game_state)

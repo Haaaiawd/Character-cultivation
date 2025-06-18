@@ -13,12 +13,23 @@ class GameState(CustomBase): # Ensure GameState is defined before GameSave
     current_scene_id = Column(String, nullable=True)
     story_history = Column(JSON, default=list)
     game_data = Column(JSON, default=dict)
+<<<<<<< HEAD
+=======
+
+    current_date = Column(String, nullable=True) # ADDED: For in-game date, e.g., "Day 1"
+
+>>>>>>> origin/haa
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     character = relationship("Character", back_populates="game_states")
 
     def __repr__(self) -> str:
+<<<<<<< HEAD
         return f"<GameState(character_id={self.character_id}, scene='{self.current_scene_id}')>"
+=======
+        # Assuming self.id is available from CustomBase after instance creation and DB flush/commit
+        return f"<GameState(id={getattr(self, 'id', None)}, char_id={self.character_id}, date='{self.current_date}')>"
+>>>>>>> origin/haa
 
 class GameSave(CustomBase):
     __tablename__ = "game_saves"
